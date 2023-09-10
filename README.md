@@ -1,0 +1,2 @@
+# Spatial_probabilistic_targeting
+This repository contains R functions and an example on using causal random forest and spatial Bayesian kriging to make a spatial probabilistic assessment. The cleaning code can be found here:<a href="https://htmlpreview.github.io/?https://github.com/EiA2030-ex-ante/Spatial_probabilistic_targeting/blob/main/LDS_cleaning_wheat_public.html" target="_blank">LDS_Cleaning</a>

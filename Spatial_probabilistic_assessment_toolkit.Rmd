@@ -1,0 +1,456 @@
+---
+title: "Spatial_probabilistic_assessment_toolkit"
+author: "Maxwell Mkondiwa"
+date: "2023-06-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This code provides a detailed analysis on how farm survey can be used to estimate a yield production function/response function. Then use it together with weather risk and price risk to characterize the yield gains from adoption of different agronomic recommendations.
+
+# Preliminaries
+
+```{r, message=FALSE}
+rm(list=ls())         # clear 
+
+load("LDS_Public_Workspace.RData")
+
+LDSestim=LDS
+table(LDSestim$Sowing_Date_Schedule) 
+table(LDSestim$Sowing_Date_Early) 
+```
+
+# Causal Random Model
+
+## Probability model
+
+```{r}
+#2 Early Sowing -------------------------------------------------------
+
+## Estimate a probit model for sowing incidence ---------------------------
+m_ps_sow <- glm(Sowing_Date_Early~D.q401_soilTexture+A.q112_fEdu+C.q306_cropLarestAreaHA+D.prevCrop_Rice+variety_type_NMWV+A.q111_fGenderdum+temp+precip+wc2.1_30s_elev+
+                  M.q708_marketDistance+nitrogen_0.5cm+sand_0.5cm+soc_5.15cm,family = binomial(link=probit), data = LDSestim)
+summary(m_ps_sow)
+
+
+LDSestim$ID_sow_model=rownames(LDSestim)
+
+prs_df_sow <- data.frame(pr_score = predict(m_ps_sow, type = "response"),
+                         Sowing_Date_Early_dum=m_ps_sow$model$Sowing_Date_Early,
+                         ID_sow_model=rownames(m_ps_sow$model))
+
+head(prs_df_sow)
+
+
+sum(prs_df_sow$pr_score< 0.1, na.rm=TRUE) # Very good commons support
+sum(prs_df_sow$pr_score> 0.9, na.rm=TRUE)  # see https://doi.org/10.1093/biomet/asn055 #
+
+#prs_df_sow$pr_score[prs_df_sow$pr_score< 0.1]=NA
+#prs_df_sow$pr_score[prs_df_sow$pr_score> 0.9]=NA
+
+prs_df_sow_small=subset(prs_df_sow,!(is.na(prs_df_sow$pr_score)))
+prs_df_sow_small_LDSestim=merge(prs_df_sow_small,LDSestim,by="ID_sow_model")
+
+# Common support
+library(ggplot2)
+library(tidyverse)
+labs <- paste("Actual sowing dates:", c("Early sowing", "Late sowing"))
+
+propensityscore_sowingplot=prs_df_sow_small_LDSestim %>%
+  mutate(Sowing_Date_Early = ifelse(Sowing_Date_Early == 1, labs[1], labs[2])) %>%
+  ggplot(aes(x = pr_score)) +
+  geom_histogram(color = "white") +
+  facet_wrap(~Sowing_Date_Early) +
+  xlab("Probability of sowing early") +
+  theme_bw()
+propensityscore_sowingplot
+
+Weights_sow=as.vector(prs_df_sow_small_LDSestim$pr_score)
+
+```
+
+## Causal forest estimator
+
+```{r}
+library(grf)
+## Y vars ----------------------------------------------------------------------
+Y_sow <- as.vector(prs_df_sow_small_LDSestim$L.tonPerHectare)
+
+## Regression forest ---------------
+X_sow=subset(prs_df_sow_small_LDSestim, select=c("I.q5505_weedSeverity_num","I.q5509_diseaseSeverity_num","I.q5506_insectSeverity_num",                                          "I.q5502_droughtSeverity_num","Nperha","P2O5perha","variety_type_NMWV","G.q5305_irrigTimes","A.q111_fGenderdum","Weedmanaged","temp","precip","wc2.1_30s_elev",
+                                              "M.q708_marketDistance","nitrogen_0.5cm","sand_0.5cm", "soc_5.15cm","O.largestPlotGPS.Latitude","O.largestPlotGPS.Longitude"))
+
+Y.forest_sow = regression_forest(X_sow,Y_sow,
+                                 equalize.cluster.weights=FALSE,
+                                 tune.parameters="all",
+                                 seed=12345)
+print(Y.forest_sow)
+varimp_rf_sow = variable_importance(Y.forest_sow)
+
+## Causal random forest -----------------
+
+X_cf_sowing=subset(prs_df_sow_small_LDSestim, select=c("I.q5505_weedSeverity_num","I.q5509_diseaseSeverity_num","I.q5506_insectSeverity_num",
+                                                       "I.q5502_droughtSeverity_num","Nperha","P2O5perha","variety_type_NMWV","G.q5305_irrigTimes","A.q111_fGenderdum","Weedmanaged","temp","precip","wc2.1_30s_elev",
+                                                       "M.q708_marketDistance","nitrogen_0.5cm","sand_0.5cm", "soc_5.15cm","O.largestPlotGPS.Latitude","O.largestPlotGPS.Longitude"))
+
+# Fit a regression model to predict treatment variable weeding
+forest.W_sowing <- regression_forest(X =X_cf_sowing , Y = prs_df_sow_small_LDSestim$Sowing_Date_Early, tune.parameters = "all")
+
+# Get out-of-bag predictions for weeding
+W_hat_sowing <- predict(forest.W_sowing)$predictions
+
+hist(W_hat_sowing, xlab = "Sowing propensity score")
+sum(W_hat_sowing< 0.1, na.rm=TRUE) # Very good commons support
+sum(W_hat_sowing> 0.9, na.rm=TRUE)
+
+# Fit a regression model to predict outcome variable yield
+forest.Y_sowing <- regression_forest(X = X_cf_sowing , Y =prs_df_sow_small_LDSestim$Sowing_Date_Early,sample.weights=Weights_sow, tune.parameters = "all")
+
+# Get out-of-bag predictions for yield
+Y.hat_sowing <- predict(forest.Y_sowing)$predictions
+
+
+W_sowing <- as.vector(prs_df_sow_small_LDSestim$Sowing_Date_Early)
+
+cf_sowing = causal_forest(X=X_cf_sowing,Y=Y_sow,W=W_sowing,
+                          Y.hat = Y.hat_sowing,
+                          #W.hat =Weights_sow, sample.weights=Weights_sow,
+                          equalize.cluster.weights=FALSE,
+                          tune.parameters="all",
+                          seed=12345,
+                          num.trees=500)
+
+cf_sowing
+
+average_treatment_effect(cf_sowing, target.sample = "all") #CATE
+average_treatment_effect(cf_sowing, target.sample = "treated") #CATT
+average_treatment_effect(cf_sowing, target.sample = "control")
+average_treatment_effect(cf_sowing, target.sample = "overlap")
+
+ate_sowing_all=average_treatment_effect(cf_sowing, target.sample = "all") #CATE
+ate_sowing_treated=average_treatment_effect(cf_sowing, target.sample = "treated") #CATT
+ate_sowing_control=average_treatment_effect(cf_sowing, target.sample = "control")
+ate_sowing_overlap=average_treatment_effect(cf_sowing, target.sample = "overlap")
+
+ate_sowing_dt=rbind(ate_sowing_all,ate_sowing_overlap,ate_sowing_treated,ate_sowing_control)
+library(reactable)
+
+reactable(ate_sowing_dt)
+
+
+
+
+
+
+
+```
+
+## Variable importance plot
+
+```{r}
+varimp.multi_sowing_cf <- variable_importance(cf_sowing)
+
+vars_sowing=c("I.q5505_weedSeverity_num","I.q5509_diseaseSeverity_num","I.q5506_insectSeverity_num",
+                                                       "I.q5502_droughtSeverity_num","Nperha","P2O5perha","variety_type_NMWV","G.q5305_irrigTimes","A.q111_fGenderdum","Weedmanaged","temp","precip","wc2.1_30s_elev",
+                                                       "M.q708_marketDistance","nitrogen_0.5cm","sand_0.5cm", "soc_5.15cm","O.largestPlotGPS.Latitude","O.largestPlotGPS.Longitude")
+
+## variable importance plot ----------------------------------------------------
+varimpvars_sowing=as.data.frame(cbind(varimp.multi_sowing_cf,vars_sowing))
+names(varimpvars_sowing)[1]="Variableimportance_sowing"
+varimpvars_sowing$Variableimportance_sowing=formatC(varimpvars_sowing$Variableimportance_sowing, digits = 2, format = "f")
+varimpvars_sowing$Variableimportance_sowing=as.numeric(varimpvars_sowing$Variableimportance_sowing)
+varimpplotRF_sowing=ggplot(varimpvars_sowing,aes(x=reorder(vars_sowing,Variableimportance_sowing),y=Variableimportance_sowing))+
+   geom_jitter(color="steelblue")+
+   coord_flip()+
+   labs(x="Variables",y="Variable importance")
+ previous_theme <- theme_set(theme_bw(base_size = 16))
+ varimpplotRF_sowing
+
+
+```
+
+## Calibration tests and HTEs
+
+To check the fit of the model, we use mean forest prediction and differential forest prediction measures which if close to 1 indicate that that model is well fitted.
+
+```{r}
+test_calibration(cf_sowing)
+
+
+tau.hat_sowing=predict(cf_sowing, target.sample = "all",estimate.variance=TRUE)
+summary(tau.hat_sowing$predict)
+
+
+X_cf_sowingtau=data.frame(X_cf_sowing,tau.hat_sowing)
+
+
+library(modelsummary)
+
+datasummary_balance(~Sowing_Date_Early, fmt = "%.3f",
+                    data=subset(LDSestim,select=c("Sowing_Date_Early","L.tonPerHectare")))
+```
+
+## Understanding mechanisms sowing date yield gains:Graphical
+
+```{r}
+library(ggplot2)
+sowingCATENitrogen=ggplot(X_cf_sowingtau,aes(Nperha,predictions))+
+  geom_smooth(method="loess",formula=y~x,col="darkblue")+
+  labs(x="Applied nitrogen (kg/ha)",y="Sowing treatment effect")
+previous_theme <- theme_set(theme_bw())
+sowingCATENitrogen
+
+
+
+sowingCATEPhosphorus=ggplot(X_cf_sowingtau,aes(P2O5perha,predictions))+
+  geom_smooth(method="loess",formula=y~x,col="darkblue")+
+  labs(x="Applied phosphorus (kg/ha)",y="sowing treatment effect")
+previous_theme <- theme_set(theme_bw())
+sowingCATEPhosphorus
+
+
+sowingCATEelev=ggplot(X_cf_sowingtau,aes(wc2.1_30s_elev,predictions))+
+  geom_smooth(method="loess",formula=y~x,col="darkblue")+
+  labs(x="Elevation",y="Sowing treatment effect")
+previous_theme <- theme_set(theme_bw())
+sowingCATEelev
+
+exportdata_cf_tau_sowing <- data.frame(prs_df_sow_small_LDSestim,tau.hat_sowing)
+
+
+sum(exportdata_cf_tau_sowing$predictions<0, na.rm=TRUE)
+sum(exportdata_cf_tau_sowing$predictions==0, na.rm=TRUE)
+sum(exportdata_cf_tau_sowing$predictions>0, na.rm=TRUE)
+
+### Mapping CATE results over space ---------
+library(sp)
+prs_df_sow_small_LDSestimsp=SpatialPointsDataFrame(cbind(prs_df_sow_small_LDSestim$O.largestPlotGPS.Longitude,prs_df_sow_small_LDSestim$O.largestPlotGPS.Latitude),data=prs_df_sow_small_LDSestim,proj4string=CRS("+proj=longlat +datum=WGS84"))
+
+prs_df_sow_small_LDSestimsp$tau.hat_sowing_predictions=tau.hat_sowing$predictions
+
+library(mapview)
+mapviewOptions(fgb = FALSE)
+tau.hat_sowing_predictionsmapview=mapview(prs_df_sow_small_LDSestimsp,zcol="tau.hat_sowing_predictions")
+tau.hat_sowing_predictionsmapview
+
+```
+
+## Understanding mechanisms sowing date yield gains:Best linear projection
+
+```{r}
+
+# DML ----------------------
+library(modelsummary)
+blpmodels=list(
+  "sowing"=best_linear_projection(cf_sowing, X_cf_sowing[,c("variety_type_NMWV","Nperha","P2O5perha","G.q5305_irrigTimes","Weedmanaged")]))
+
+
+cm=c("Weedmanaged"="Weed managed",
+      "variety_type_NMWV"="Variety type(Timely sown)",
+      "G.q5305_irrigTimes"="Irrigation times",
+      "P2O5perha"="Phosphorus",
+      "Nperha"="Nitrogen")
+modelplot(blpmodels,coef_map=cm,coef_omit = "Inte")+
+geom_vline(aes(xintercept=0),
+           color="black", linetype="dotted", size=1)
+
+
+modelsummary(blpmodels,coef_map=cm)
+
+```
+
+## Checking evidence of heterogeneity
+
+```{r}
+
+# RATE -------------------------------
+library(grf)
+tau.hat.cf_sowing <- predict(cf_sowing, X_cf_sowing)$predictions
+cf_sowingRATE <- rank_average_treatment_effect(cf_sowing, tau.hat.cf_sowing, target = "AUTOC")
+cf_sowingRATE
+
+plot(cf_sowingRATE, xlab = "Treated fraction")
+```
+
+# Spatial Bayesian Kriging
+
+```{r}
+### Bayesian kriging 
+
+# Bayesian models take much time to render. We sample 1000 observations to showcase the approach
+
+prs_df_sow_small_LDSestim_tau=cbind(prs_df_sow_small_LDSestim,tau.hat_sowing)
+
+prs_df_sow_small_LDSestim_tau = prs_df_sow_small_LDSestim_tau[sample(1:nrow(prs_df_sow_small_LDSestim_tau), 2000),]
+  
+coords=dplyr::select(prs_df_sow_small_LDSestim_tau,O.largestPlotGPS.Longitude,O.largestPlotGPS.Latitude)
+coords=as.matrix(coords)
+
+# The public version of the data has duplicated coordinates
+# We need to jitter these because spatial Bayesian kriging requires unique coordinates. 
+library(geoR)
+coords=jitterDupCoords(coords,min=2,max=10)
+coords=as.matrix(coords)
+
+library(spBayes)
+n.samples=1000
+
+t1 <- Sys.time()
+
+r <-1
+n.ltr <- r*(r+1)/2
+
+priors <- list("phi.Unif"=list(rep(1,r), rep(10,r)), "K.IW"=list(r, diag(rep(1,r))), "tau.sq.IG"=c(2, 1))
+
+starting <- list("phi"=rep(3/0.5,r), "A"=rep(1,n.ltr), "tau.sq"=1) 
+
+tuning <- list("phi"=rep(0.1,r), "A"=rep(0.01, n.ltr), "tau.sq"=0.01)
+
+cf.sowing.sp <- spBayes::spSVC(predictions~1, data=prs_df_sow_small_LDSestim_tau,coords=coords,
+                                  starting= starting,
+                                  tuning=tuning,
+                                  priors=priors,
+                                  cov.model="exponential",n.samples=n.samples,
+                                  n.omp.threads=15,svc.cols=c("(Intercept)"))
+
+
+t2 <- Sys.time()
+t2 - t1
+
+
+burn.in <- floor(0.75*n.samples) 
+
+cf.sowing.sp.r <- spRecover(cf.sowing.sp, start=burn.in)
+
+library(terra)
+library(stars)
+library(raster)
+
+# Inverse distance approach -----
+library(gstat) # Use gstat's idw routine
+library(sp)    # Used for the spsample function
+library(tmap)
+
+#wgs84.prj=CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0")
+#India_State_Boundary_Bihar_wgs84.prj= spTransform(India_State_Boundary_Bihar,wgs84.prj)
+
+library(geodata)
+
+
+# India=gadm(country="IND", level=1, path=tempdir())
+# plot(India)
+# India_Bihar=subset(India,India$NAME_1=="Bihar")
+# plot(India_Bihar)
+library(sf)
+India_State_Boundary=read_sf("D:/OneDrive/CIMMYT/Data/shp/India_State_Boundary.shp")
+India_State_Boundary_Bihar=subset(India_State_Boundary,India_State_Boundary$State_Name=="Bihar")
+India_State_Boundary_Bihar_sp=as_Spatial(India_State_Boundary_Bihar)
+prs_df_sow_small_LDSestimsp@bbox <- India_State_Boundary_Bihar_sp@bbox 
+
+grd <- as.data.frame(spsample(prs_df_sow_small_LDSestimsp, "regular", n=10000))
+
+names(grd)       <- c("X", "Y")
+coordinates(grd) <- c("X", "Y")
+gridded(grd)     <- TRUE  # Create SpatialPixel object
+fullgrid(grd)    <- TRUE  # Create SpatialGrid object
+plot(grd)
+#proj4string(prs_df_sow_small_LDSestimsp) <- proj4string(prs_df_sow_small_LDSestimsp) # Temp fix until new proj env is adopted
+#proj4string(grd) <- proj4string(prs_df_sow_small_LDSestimsp)
+
+library(spBayes)
+
+India_State_Boundary_Bihar_wgs84.prj2poly <- India_State_Boundary_Bihar_sp@polygons[[1]]@Polygons[[1]]@coords 
+India_State_Boundary_Bihar_wgs84.prj.poly <- as.matrix(India_State_Boundary_Bihar_wgs84.prj2poly)
+
+pred.coords <- SpatialPoints(grd)@coords 
+pointsInPolyOut <- pointsInPoly(India_State_Boundary_Bihar_wgs84.prj.poly, pred.coords) 
+pred.coords <- pred.coords[pointsInPolyOut,]
+
+
+pred.covars <- as.matrix(rep(1, nrow(pred.coords)))
+
+cf.sowing.sp.pred <- spPredict(cf.sowing.sp.r,pred.coords=pred.coords,
+                                    pred.covars=pred.covars,n.omp.threads=15)
+
+
+cf.sowing.sp.pred.pred.mu = apply(cf.sowing.sp.pred$p.y.predictive.samples,1,mean)
+cf.sowing.sp.pred.sd = apply(cf.sowing.sp.pred$p.y.predictive.samples,1,sd)
+
+library(MBA)
+library(fields)
+x.res=100
+y.res=100
+surf <- mba.surf(cbind(coords, tau.hat.cf_sowing), no.X=x.res, no.Y=x.res,extend=TRUE, sp=TRUE)$xyz.est
+#surf <- surf [!is.na(overlay(surf, India_State_Boundary_Bihar_wgs84.prj)),] 
+surf <- as.image.SpatialGridDataFrame(surf) 
+z.lim <- range(surf[["z"]], na.rm=TRUE) 
+pred.grid <- as.data.frame(list(pred.coords,pred.mu=cf.sowing.sp.pred.pred.mu,pred.sd=cf.sowing.sp.pred.sd))
+
+coordinates(pred.grid) = c("X", "Y") 
+gridded(pred.grid) <- TRUE 
+pred.mu.image <- as.image.SpatialGridDataFrame(pred.grid["pred.mu"])
+pred.sd.image <- as.image.SpatialGridDataFrame(pred.grid["pred.sd"])
+
+library(fields)
+image.plot(surf, axes=TRUE, zlim=z.lim, col=tim.colors(25),xaxs = "r", yaxs = "r",main="Yield gain")
+plot(India_State_Boundary_Bihar, add=TRUE) 
+
+
+# predict and probability ------------------------------------------------
+
+cf.sowing.sp.pred.pred.prob=rowSums(cf.sowing.sp.pred$p.y.predictive.samples>0)/251
+cf.sowing.sp.pred.pred.prob50kg=rowSums(cf.sowing.sp.pred$p.y.predictive.samples>0.05)/251
+cf.sowing.sp.pred.pred.prob100kg=rowSums(cf.sowing.sp.pred$p.y.predictive.samples>0.1)/251
+
+
+library(MBA)
+surf <- mba.surf(cbind(coords, tau.hat.cf_sowing), no.X=x.res, no.Y=x.res,extend=TRUE, sp=TRUE)$xyz.est
+surf <- as.image.SpatialGridDataFrame(surf) 
+z.lim <- range(surf[["z"]], na.rm=TRUE) 
+
+pred.grid <- as.data.frame(list(pred.coords,pred.mu=cf.sowing.sp.pred.pred.mu,pred.sd=cf.sowing.sp.pred.sd,
+                                pred.prob=cf.sowing.sp.pred.pred.prob,pred.prob50kg=cf.sowing.sp.pred.pred.prob50kg,
+                                pred.prob100kg=cf.sowing.sp.pred.pred.prob100kg))
+
+coordinates(pred.grid) = c("X", "Y") 
+gridded(pred.grid) <- TRUE 
+
+pred.mu.image <- as.image.SpatialGridDataFrame(pred.grid["pred.mu"])
+pred.sd.image <- as.image.SpatialGridDataFrame(pred.grid["pred.sd"])
+pred.prob.image <- as.image.SpatialGridDataFrame(pred.grid["pred.prob"])
+pred.prob.image50kg <- as.image.SpatialGridDataFrame(pred.grid["pred.prob50kg"])
+pred.prob.image100kg <- as.image.SpatialGridDataFrame(pred.grid["pred.prob100kg"])
+
+# Try with plot raster ----------
+
+library(rgdal)
+library(raster)
+library(plotKML)
+library(mlr)
+
+
+plot(raster(pred.prob.image),col=inferno(5),main="Probability of sowing yield gains>0")
+
+plot(raster(pred.prob.image50kg),col=inferno(5),main="Probability of sowing yield gains>50kg/ha")
+
+plot(raster(pred.prob.image100kg),col=inferno(5),main="Probability of sowing yield gains>100kg/ha")
+
+
+plot(raster(pred.prob.image),col=inferno(5),main="Probability of sowing yield gains>0")
+contour(pred.prob.image, add=T)
+plot(raster(pred.prob.image50kg),col=inferno(5),main="Probability of sowing yield gains>50kg/ha")
+contour(pred.prob.image, add=T)
+plot(raster(pred.prob.image100kg),col=inferno(5),main="Probability of sowing yield gains>100kg/ha")
+contour(pred.prob.image, add=T)
+
+
+```
+
+# Conclusion
+
+In this notebook, we have shown how causal ML and spatial Bayesian kriging can be used to make probabilistic assessments of the yield gain and profitability assessments.
