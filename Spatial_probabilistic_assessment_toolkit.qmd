@@ -1,15 +1,21 @@
 ---
-title: "Causal ML and Spatial Probabilistic Assessment Toolkit"
+title: "Targeting sowing dates: Causal ML and Spatial Probabilistic Assessment Toolkit"
 format: html
-#format: gfm
+fig-dpi: 300
+fig-width: 8.88
+fig-align: center
+fig-height: 5
+
 self-contained: true
 author: Maxwell Mkondiwa
 editor: visual
 toc: true
 toc-location: left
 number-sections: true
-#execute: 
-#  keep-md: true
+execute: 
+  message: false
+  warning: false
+  echo: true
 ---
 
 # Introduction
